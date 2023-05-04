@@ -1,4 +1,4 @@
-# @version 0.3.7
+# @version 0.2.4
 """
 @title Voting Escrow
 @author Curve Finance
@@ -6,7 +6,7 @@
 @notice Votes have a weight depending on time, so that users are
         committed to the future of (whatever they are voting for)
 @dev Vote weight decays linearly over time. Lock time cannot be
-     more than `MAXTIME` (1 year).
+     more than `MAXTIME` (4 years).
 """
 
 # Voting escrow to have time-weighted votes
@@ -20,7 +20,7 @@
 #   |  /
 #   |/
 # 0 +--------+------> time
-#       maxtime (1 year?)
+#       maxtime (4 years?)
 
 struct Point:
     bias: int128
@@ -57,6 +57,13 @@ CREATE_LOCK_TYPE: constant(int128) = 1
 INCREASE_LOCK_AMOUNT: constant(int128) = 2
 INCREASE_UNLOCK_TIME: constant(int128) = 3
 
+
+event CommitOwnership:
+    admin: address
+
+event ApplyOwnership:
+    admin: address
+
 event Deposit:
     provider: indexed(address)
     value: uint256
@@ -73,26 +80,14 @@ event Supply:
     prevSupply: uint256
     supply: uint256
 
-event NewPendingAdmin:
-    new_pending_admin: address
-
-event NewAdmin:
-    new_admin: address
-
 
 WEEK: constant(uint256) = 7 * 86400  # all future times are rounded by week
 MAXTIME: constant(uint256) = 4 * 365 * 86400  # 4 years
 MULTIPLIER: constant(uint256) = 10 ** 18
 
-TOKEN: immutable(address)
-NAME: immutable(String[64])
-SYMBOL: immutable(String[32])
-DECIMALS: immutable(uint256)
-
-pending_admin: public(address)
-admin: public(address)
-
+token: public(address)
 supply: public(uint256)
+
 locked: public(HashMap[address, LockedBalance])
 
 epoch: public(uint256)
@@ -101,58 +96,70 @@ user_point_history: public(HashMap[address, Point[1000000000]])  # user -> Point
 user_point_epoch: public(HashMap[address, uint256])
 slope_changes: public(HashMap[uint256, int128])  # time -> signed slope change
 
+# Aragon's view methods for compatibility
+controller: public(address)
+transfersEnabled: public(bool)
+
+name: public(String[64])
+symbol: public(String[32])
+version: public(String[32])
+decimals: public(uint256)
+
 # Checker for whitelisted (smart contract) wallets which are allowed to deposit
 # The goal is to prevent tokenizing the escrow
 future_smart_wallet_checker: public(address)
 smart_wallet_checker: public(address)
 
+admin: public(address)  # Can and will be a smart contract
+future_admin: public(address)
+
 
 @external
-def __init__(token_addr: address, _name: String[64], _symbol: String[32], _admin: address):
+def __init__(token_addr: address, _name: String[64], _symbol: String[32], _version: String[32]):
     """
     @notice Contract constructor
-    @param token_addr The token to escrow
+    @param token_addr `ERC20CRV` token address
     @param _name Token name
     @param _symbol Token symbol
-    @param _admin The admin address
+    @param _version Contract version - required for Aragon compatibility
     """
-    assert _admin != empty(address)
-
-    TOKEN = token_addr
-    self.admin = _admin
+    self.admin = msg.sender
+    self.token = token_addr
     self.point_history[0].blk = block.number
     self.point_history[0].ts = block.timestamp
+    self.controller = msg.sender
+    self.transfersEnabled = True
 
     _decimals: uint256 = ERC20(token_addr).decimals()
     assert _decimals <= 255
+    self.decimals = _decimals
 
-    NAME = _name
-    SYMBOL = _symbol
-    DECIMALS = _decimals
-
-
-@external
-@view
-def token() -> address:
-    return TOKEN
+    self.name = _name
+    self.symbol = _symbol
+    self.version = _version
 
 
 @external
-@view
-def name() -> String[64]:
-    return NAME
+def commit_transfer_ownership(addr: address):
+    """
+    @notice Transfer ownership of VotingEscrow contract to `addr`
+    @param addr Address to have ownership transferred to
+    """
+    assert msg.sender == self.admin  # dev: admin only
+    self.future_admin = addr
+    log CommitOwnership(addr)
 
 
 @external
-@view
-def symbol() -> String[32]:
-    return SYMBOL
-
-
-@external
-@view
-def decimals() -> uint256:
-    return DECIMALS
+def apply_transfer_ownership():
+    """
+    @notice Apply ownership transfer
+    """
+    assert msg.sender == self.admin  # dev: admin only
+    _admin: address = self.future_admin
+    assert _admin != ZERO_ADDRESS  # dev: admin not set
+    self.admin = _admin
+    log ApplyOwnership(_admin)
 
 
 @external
@@ -182,7 +189,7 @@ def assert_not_contract(addr: address):
     """
     if addr != tx.origin:
         checker: address = self.smart_wallet_checker
-        if checker != empty(address):
+        if checker != ZERO_ADDRESS:
             if SmartWalletChecker(checker).check(addr):
                 return
         raise "Smart contract depositors not allowed"
@@ -237,14 +244,14 @@ def _checkpoint(addr: address, old_locked: LockedBalance, new_locked: LockedBala
     new_dslope: int128 = 0
     _epoch: uint256 = self.epoch
 
-    if addr != empty(address):
+    if addr != ZERO_ADDRESS:
         # Calculate slopes and biases
         # Kept at zero when they have to
         if old_locked.end > block.timestamp and old_locked.amount > 0:
-            u_old.slope = old_locked.amount / convert(MAXTIME, int128)
+            u_old.slope = old_locked.amount / MAXTIME
             u_old.bias = u_old.slope * convert(old_locked.end - block.timestamp, int128)
         if new_locked.end > block.timestamp and new_locked.amount > 0:
-            u_new.slope = new_locked.amount / convert(MAXTIME, int128)
+            u_new.slope = new_locked.amount / MAXTIME
             u_new.bias = u_new.slope * convert(new_locked.end - block.timestamp, int128)
 
         # Read values of scheduled changes in the slope
@@ -301,7 +308,7 @@ def _checkpoint(addr: address, old_locked: LockedBalance, new_locked: LockedBala
     self.epoch = _epoch
     # Now point_history is filled until t=now
 
-    if addr != empty(address):
+    if addr != ZERO_ADDRESS:
         # If last point was in this block, the slope change has been applied already
         # But in such case we have 0 slope(s)
         last_point.slope += (u_new.slope - u_old.slope)
@@ -314,7 +321,7 @@ def _checkpoint(addr: address, old_locked: LockedBalance, new_locked: LockedBala
     # Record the changed point into history
     self.point_history[_epoch] = last_point
 
-    if addr != empty(address):
+    if addr != ZERO_ADDRESS:
         # Schedule the slope changes (slope is going down)
         # We subtract new_user_slope from [new_locked.end]
         # and add old_user_slope to [old_locked.end]
@@ -367,7 +374,7 @@ def _deposit_for(_addr: address, _value: uint256, unlock_time: uint256, locked_b
     self._checkpoint(_addr, old_locked, _locked)
 
     if _value != 0:
-        assert ERC20(TOKEN).transferFrom(_addr, self, _value)
+        assert ERC20(self.token).transferFrom(_addr, self, _value)
 
     log Deposit(_addr, _value, _locked.end, type, block.timestamp)
     log Supply(supply_before, supply_before + _value)
@@ -378,7 +385,7 @@ def checkpoint():
     """
     @notice Record global data to checkpoint
     """
-    self._checkpoint(empty(address), empty(LockedBalance), empty(LockedBalance))
+    self._checkpoint(ZERO_ADDRESS, empty(LockedBalance), empty(LockedBalance))
 
 
 @external
@@ -415,7 +422,7 @@ def create_lock(_value: uint256, _unlock_time: uint256):
     assert _value > 0  # dev: need non-zero value
     assert _locked.amount == 0, "Withdraw old tokens first"
     assert unlock_time > block.timestamp, "Can only lock until time in the future"
-    assert unlock_time <= block.timestamp + MAXTIME, "Voting lock can be 1 year max"
+    assert unlock_time <= block.timestamp + MAXTIME, "Voting lock can be 4 years max"
 
     self._deposit_for(msg.sender, _value, unlock_time, _locked, CREATE_LOCK_TYPE)
 
@@ -452,7 +459,7 @@ def increase_unlock_time(_unlock_time: uint256):
     assert _locked.end > block.timestamp, "Lock expired"
     assert _locked.amount > 0, "Nothing is locked"
     assert unlock_time > _locked.end, "Can only increase lock duration"
-    assert unlock_time <= block.timestamp + MAXTIME, "Voting lock can be 1 year max"
+    assert unlock_time <= block.timestamp + MAXTIME, "Voting lock can be 4 years max"
 
     self._deposit_for(msg.sender, 0, unlock_time, _locked, INCREASE_UNLOCK_TIME)
 
@@ -480,7 +487,7 @@ def withdraw():
     # Both can have >= 0 amount
     self._checkpoint(msg.sender, old_locked, _locked)
 
-    assert ERC20(TOKEN).transfer(msg.sender, value)
+    assert ERC20(self.token).transfer(msg.sender, value)
 
     log Withdraw(msg.sender, value, block.timestamp)
     log Supply(supply_before, supply_before - value)
@@ -494,10 +501,10 @@ def withdraw():
 @view
 def find_block_epoch(_block: uint256, max_epoch: uint256) -> uint256:
     """
-    @notice Binary search to find epoch containing block number
+    @notice Binary search to estimate timestamp for block number
     @param _block Block to find
     @param max_epoch Don't go beyond this epoch
-    @return Epoch which contains _block
+    @return Approximate timestamp for block
     """
     # Binary search
     _min: uint256 = 0
@@ -507,77 +514,6 @@ def find_block_epoch(_block: uint256, max_epoch: uint256) -> uint256:
             break
         _mid: uint256 = (_min + _max + 1) / 2
         if self.point_history[_mid].blk <= _block:
-            _min = _mid
-        else:
-            _max = _mid - 1
-    return _min
-
-
-@internal
-@view
-def find_timestamp_epoch(_timestamp: uint256, max_epoch: uint256) -> uint256:
-    """
-    @notice Binary search to find epoch for timestamp
-    @param _timestamp timestamp to find
-    @param max_epoch Don't go beyond this epoch
-    @return Epoch which contains _timestamp
-    """
-    # Binary search
-    _min: uint256 = 0
-    _max: uint256 = max_epoch
-    for i in range(128):  # Will be always enough for 128-bit numbers
-        if _min >= _max:
-            break
-        _mid: uint256 = (_min + _max + 1) / 2
-        if self.point_history[_mid].ts <= _timestamp:
-            _min = _mid
-        else:
-            _max = _mid - 1
-    return _min
-
-
-@internal
-@view
-def find_block_user_epoch(_addr: address, _block: uint256, max_epoch: uint256) -> uint256:
-    """
-    @notice Binary search to find epoch for block number
-    @param _addr User for which to find user epoch for
-    @param _block Block to find
-    @param max_epoch Don't go beyond this epoch
-    @return Epoch which contains _block
-    """
-    # Binary search
-    _min: uint256 = 0
-    _max: uint256 = max_epoch
-    for i in range(128):  # Will be always enough for 128-bit numbers
-        if _min >= _max:
-            break
-        _mid: uint256 = (_min + _max + 1) / 2
-        if self.user_point_history[_addr][_mid].blk <= _block:
-            _min = _mid
-        else:
-            _max = _mid - 1
-    return _min
-
-
-@internal
-@view
-def find_timestamp_user_epoch(_addr: address, _timestamp: uint256, max_epoch: uint256) -> uint256:
-    """
-    @notice Binary search to find user epoch for timestamp
-    @param _addr User for which to find user epoch for
-    @param _timestamp timestamp to find
-    @param max_epoch Don't go beyond this epoch
-    @return Epoch which contains _timestamp
-    """
-    # Binary search
-    _min: uint256 = 0
-    _max: uint256 = max_epoch
-    for i in range(128):  # Will be always enough for 128-bit numbers
-        if _min >= _max:
-            break
-        _mid: uint256 = (_min + _max + 1) / 2
-        if self.user_point_history[_addr][_mid].ts <= _timestamp:
             _min = _mid
         else:
             _max = _mid - 1
@@ -594,13 +530,7 @@ def balanceOf(addr: address, _t: uint256 = block.timestamp) -> uint256:
     @param _t Epoch time to return voting power at
     @return User voting power
     """
-    _epoch: uint256 = 0
-    if _t == block.timestamp:
-        # No need to do binary search, will always live in current epoch
-        _epoch = self.user_point_epoch[addr]
-    else:
-        _epoch = self.find_timestamp_user_epoch(addr, _t, self.user_point_epoch[addr])
-
+    _epoch: uint256 = self.user_point_epoch[addr]
     if _epoch == 0:
         return 0
     else:
@@ -625,8 +555,19 @@ def balanceOfAt(addr: address, _block: uint256) -> uint256:
     # reference yet
     assert _block <= block.number
 
-    _user_epoch: uint256 = self.find_block_user_epoch(addr, _block, self.user_point_epoch[addr])
-    upoint: Point = self.user_point_history[addr][_user_epoch]
+    # Binary search
+    _min: uint256 = 0
+    _max: uint256 = self.user_point_epoch[addr]
+    for i in range(128):  # Will be always enough for 128-bit numbers
+        if _min >= _max:
+            break
+        _mid: uint256 = (_min + _max + 1) / 2
+        if self.user_point_history[addr][_mid].blk <= _block:
+            _min = _mid
+        else:
+            _max = _mid - 1
+
+    upoint: Point = self.user_point_history[addr][_min]
 
     max_epoch: uint256 = self.epoch
     _epoch: uint256 = self.find_block_epoch(_block, max_epoch)
@@ -688,18 +629,9 @@ def totalSupply(t: uint256 = block.timestamp) -> uint256:
     @dev Adheres to the ERC20 `totalSupply` interface for Aragon compatibility
     @return Total voting power
     """
-    _epoch: uint256 = 0
-    if t == block.timestamp:
-        # No need to do binary search, will always live in current epoch
-        _epoch = self.epoch
-    else:
-        _epoch = self.find_timestamp_epoch(t, self.epoch)
-
-    if _epoch == 0:
-        return 0
-    else:
-        last_point: Point = self.point_history[_epoch]
-        return self.supply_at(last_point, t)
+    _epoch: uint256 = self.epoch
+    last_point: Point = self.point_history[_epoch]
+    return self.supply_at(last_point, t)
 
 
 @external
@@ -728,27 +660,12 @@ def totalSupplyAt(_block: uint256) -> uint256:
     return self.supply_at(point, point.ts + dt)
 
 
-@external
-def change_pending_admin(new_pending_admin: address):
-    """
-    @notice Change pending_admin to `new_pending_admin`
-    @param new_pending_admin The new pending_admin address
-    """
-    assert msg.sender == self.admin
-
-    self.pending_admin = new_pending_admin
-
-    log NewPendingAdmin(new_pending_admin)
-
+# Dummy methods for compatibility with Aragon
 
 @external
-def claim_admin():
+def changeController(_newController: address):
     """
-    @notice Called by pending_admin to set admin to pending_admin
+    @dev Dummy method required for Aragon compatibility
     """
-    assert msg.sender == self.pending_admin
-
-    self.admin = msg.sender
-    self.pending_admin = empty(address)
-
-    log NewAdmin(msg.sender)
+    assert msg.sender == self.controller
+    self.controller = _newController

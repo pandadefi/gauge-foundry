@@ -1,4 +1,4 @@
-# @version 0.3.7
+# @version 0.3.1
 """
 @title Child Liquidity Gauge
 @license MIT
@@ -21,13 +21,6 @@ interface Minter:
 
 interface ERC1271:
     def isValidSignature(_hash: bytes32, _signature: Bytes[65]) -> bytes32: view
-
-interface VotingEscrow:
-    def user_point_epoch(addr: address) -> uint256: view
-    def user_point_history__ts(addr: address, epoch: uint256) -> uint256: view
-
-interface UniswapPoorOracle:
-    def getPositionStateFromKey(key: bytes32) -> uint256: view
 
 
 event Approval:
@@ -55,9 +48,6 @@ event UpdateLiquidityLimit:
     _working_balance: uint256
     _working_supply: uint256
 
-event NewTokenlessProduction:
-    new_tokenless_production: uint8
-
 
 struct Reward:
     distributor: address
@@ -72,23 +62,17 @@ PERMIT_TYPE_HASH: constant(bytes32) = keccak256("Permit(address owner,address sp
 ERC1271_MAGIC_VAL: constant(bytes32) = 0x1626ba7e00000000000000000000000000000000000000000000000000000000
 
 MAX_REWARDS: constant(uint256) = 8
+TOKENLESS_PRODUCTION: constant(uint256) = 40
 WEEK: constant(uint256) = 86400 * 7
 VERSION: constant(String[8]) = "v0.1.0"
 
 
-TOKEN: immutable(address)
+CRV: immutable(address)
 FACTORY: immutable(address)
-UNISWAP_POOR_ORACLE: immutable(UniswapPoorOracle)
 
 
 DOMAIN_SEPARATOR: public(bytes32)
 nonces: public(HashMap[address, uint256])
-
-tokenless_production: public(uint8)
-gauge_state: public(uint8)
-lp_token: public(address)
-manager: public(address)
-position_key: public(bytes32)
 
 name: public(String[64])
 symbol: public(String[32])
@@ -97,6 +81,10 @@ allowance: public(HashMap[address, HashMap[address, uint256]])
 balanceOf: public(HashMap[address, uint256])
 totalSupply: public(uint256)
 
+lp_token: public(address)
+manager: public(address)
+
+voting_escrow: public(address)
 working_balances: public(HashMap[address, uint256])
 working_supply: public(uint256)
 
@@ -119,30 +107,30 @@ reward_integral_for: public(HashMap[address, HashMap[address, uint256]])
 # user -> token -> [uint128 claimable amount][uint128 claimed amount]
 claim_data: HashMap[address, HashMap[address, uint256]]
 
+is_killed: public(bool)
 inflation_rate: public(HashMap[uint256, uint256])
 
 
 @external
-def __init__(_token: address, _factory: address, _uniswap_poor_oracle: UniswapPoorOracle):
+def __init__(_crv_token: address, _factory: address):
     self.lp_token = 0x000000000000000000000000000000000000dEaD
 
-    TOKEN = _token
+    CRV = _crv_token
     FACTORY = _factory
-    UNISWAP_POOR_ORACLE = _uniswap_poor_oracle
 
 
 @internal
 def _checkpoint(_user: address):
     """
-    @notice Checkpoint a user calculating their TOKEN entitlement
+    @notice Checkpoint a user calculating their CRV entitlement
     @param _user User address
     """
     period: uint256 = self.period
     period_time: uint256 = self.period_timestamp[period]
     integrate_inv_supply: uint256 = self.integrate_inv_supply[period]
-    killed: bool = self._is_killed()
 
-    if block.timestamp > period_time and not killed:
+    if block.timestamp > period_time:
+
         working_supply: uint256 = self.working_supply
         prev_week_time: uint256 = period_time
         week_time: uint256 = min((period_time + WEEK) / WEEK * WEEK, block.timestamp)
@@ -161,12 +149,12 @@ def _checkpoint(_user: address):
             prev_week_time = week_time
             week_time = min(week_time + WEEK, block.timestamp)
 
-    # check TOKEN balance and increase weekly inflation rate by delta for the rest of the week
-    token_balance: uint256 = ERC20(TOKEN).balanceOf(self)
-    if token_balance != 0:
+    # check CRV balance and increase weekly inflation rate by delta for the rest of the week
+    crv_balance: uint256 = ERC20(CRV).balanceOf(self)
+    if crv_balance != 0:
         current_week: uint256 = block.timestamp / WEEK
-        self.inflation_rate[current_week] += token_balance / ((current_week + 1) * WEEK - block.timestamp)
-        ERC20(TOKEN).transfer(FACTORY, token_balance)
+        self.inflation_rate[current_week] += crv_balance / ((current_week + 1) * WEEK - block.timestamp)
+        ERC20(CRV).transfer(FACTORY, crv_balance)
 
     period += 1
     self.period = period
@@ -182,20 +170,20 @@ def _checkpoint(_user: address):
 @internal
 def _update_liquidity_limit(_user: address, _user_balance: uint256, _total_supply: uint256):
     """
-    @notice Calculate working balances to apply amplification of TOKEN production.
+    @notice Calculate working balances to apply amplification of CRV production.
     @dev https://resources.curve.fi/guides/boosting-your-crv-rewards#formula
     @param _user The user address
     @param _user_balance User's amount of liquidity (LP tokens)
     @param _total_supply Total amount of liquidity (LP tokens)
     """
-    _tokenless_production: uint256 = convert(self.tokenless_production, uint256)
-    working_balance: uint256 = _user_balance * _tokenless_production / 100
+    working_balance: uint256 = _user_balance * TOKENLESS_PRODUCTION / 100
 
-    voting_escrow: ERC20 = ERC20(Factory(FACTORY).voting_escrow())
-    ve_ts: uint256 = voting_escrow.totalSupply()
-    if ve_ts != 0:
-        working_balance += _total_supply * voting_escrow.balanceOf(_user) / ve_ts * (100 - _tokenless_production) / 100
-        working_balance = min(_user_balance, working_balance)
+    ve: address = self.voting_escrow
+    if ve != ZERO_ADDRESS:
+        ve_ts: uint256 = ERC20(ve).totalSupply()
+        if ve_ts != 0:
+            working_balance += _total_supply * ERC20(ve).balanceOf(_user) / ve_ts * (100 - TOKENLESS_PRODUCTION) / 100
+            working_balance = min(_user_balance, working_balance)
 
     old_working_balance: uint256 = self.working_balances[_user]
     self.working_balances[_user] = working_balance
@@ -213,12 +201,12 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
     """
     user_balance: uint256 = 0
     receiver: address = _receiver
-    if _user != empty(address):
+    if _user != ZERO_ADDRESS:
         user_balance = self.balanceOf[_user]
-        if _claim and _receiver == empty(address):
+        if _claim and _receiver == ZERO_ADDRESS:
             # if receiver is not explicitly declared, check if a default receiver is set
             receiver = self.rewards_receiver[_user]
-            if receiver == empty(address):
+            if receiver == ZERO_ADDRESS:
                 # if no default receiver is set, direct claims to the user
                 receiver = _user
 
@@ -237,7 +225,7 @@ def _checkpoint_rewards(_user: address, _total_supply: uint256, _claim: bool, _r
                 integral += duration * self.reward_data[token].rate * 10**18 / _total_supply
                 self.reward_data[token].integral = integral
 
-        if _user != empty(address):
+        if _user != ZERO_ADDRESS:
             integral_for: uint256 = self.reward_integral_for[token][_user]
             new_claimable: uint256 = 0
 
@@ -275,7 +263,7 @@ def _transfer(_from: address, _to: address, _value: uint256):
     has_rewards: bool = self.reward_count != 0
     for addr in [_from, _to]:
         self._checkpoint(addr)
-        self._checkpoint_rewards(addr, total_supply, False, empty(address))
+        self._checkpoint_rewards(addr, total_supply, False, ZERO_ADDRESS)
 
     new_balance: uint256 = self.balanceOf[_from] - _value
     self.balanceOf[_from] = new_balance
@@ -304,7 +292,7 @@ def deposit(_value: uint256, _user: address = msg.sender, _claim_rewards: bool =
     new_balance: uint256 = self.balanceOf[_user] + _value
 
     if self.reward_count != 0:
-        self._checkpoint_rewards(_user, total_supply, _claim_rewards, empty(address))
+        self._checkpoint_rewards(_user, total_supply, _claim_rewards, ZERO_ADDRESS)
 
     total_supply += _value
 
@@ -316,7 +304,7 @@ def deposit(_value: uint256, _user: address = msg.sender, _claim_rewards: bool =
     ERC20(self.lp_token).transferFrom(msg.sender, self, _value)
 
     log Deposit(_user, _value)
-    log Transfer(empty(address), _user, _value)
+    log Transfer(ZERO_ADDRESS, _user, _value)
 
 
 @external
@@ -335,7 +323,7 @@ def withdraw(_value: uint256, _user: address = msg.sender, _claim_rewards: bool 
     new_balance: uint256 = self.balanceOf[msg.sender] - _value
 
     if self.reward_count != 0:
-        self._checkpoint_rewards(_user, total_supply, _claim_rewards, empty(address))
+        self._checkpoint_rewards(_user, total_supply, _claim_rewards, ZERO_ADDRESS)
 
     total_supply -= _value
 
@@ -347,7 +335,7 @@ def withdraw(_value: uint256, _user: address = msg.sender, _claim_rewards: bool 
     ERC20(self.lp_token).transfer(_user, _value)
 
     log Withdraw(_user, _value)
-    log Transfer(msg.sender, empty(address), _value)
+    log Transfer(msg.sender, ZERO_ADDRESS, _value)
 
 
 @external
@@ -361,7 +349,7 @@ def transferFrom(_from: address, _to: address, _value: uint256) -> bool:
     @return bool success
     """
     allowance: uint256 = self.allowance[_from][msg.sender]
-    if allowance != max_value(uint256):
+    if allowance != MAX_UINT256:
         self.allowance[_from][msg.sender] = allowance - _value
 
     self._transfer(_from, _to, _value)
@@ -413,7 +401,7 @@ def permit(
     @param _s The bytes[32:64] of the valid secp256k1 signature of permit by owner
     @return True, if transaction completes successfully
     """
-    assert _owner != empty(address)
+    assert _owner != ZERO_ADDRESS
     assert block.timestamp <= _deadline
 
     nonce: uint256 = self.nonces[_owner]
@@ -547,7 +535,7 @@ def claimable_reward(_user: address, _reward_token: address) -> uint256:
 def set_rewards_receiver(_receiver: address):
     """
     @notice Set the default reward receiver for the caller.
-    @dev When set to empty(address), rewards are sent to the caller
+    @dev When set to ZERO_ADDRESS, rewards are sent to the caller
     @param _receiver Receiver address for any rewards claimed via `claim_rewards`
     """
     self.rewards_receiver[msg.sender] = _receiver
@@ -555,15 +543,15 @@ def set_rewards_receiver(_receiver: address):
 
 @external
 @nonreentrant('lock')
-def claim_rewards(_addr: address = msg.sender, _receiver: address = empty(address)):
+def claim_rewards(_addr: address = msg.sender, _receiver: address = ZERO_ADDRESS):
     """
     @notice Claim available reward tokens for `_addr`
     @param _addr Address to claim for
     @param _receiver Address to transfer rewards to - if set to
-                     empty(address), uses the default reward receiver
+                     ZERO_ADDRESS, uses the default reward receiver
                      for the caller
     """
-    if _receiver != empty(address):
+    if _receiver != ZERO_ADDRESS:
         assert _addr == msg.sender  # dev: cannot redirect when claiming for another user
     self._checkpoint_rewards(_addr, self.totalSupply, True, _receiver)
 
@@ -577,7 +565,7 @@ def add_reward(_reward_token: address, _distributor: address):
 
     reward_count: uint256 = self.reward_count
     assert reward_count < MAX_REWARDS
-    assert self.reward_data[_reward_token].distributor == empty(address)
+    assert self.reward_data[_reward_token].distributor == ZERO_ADDRESS
 
     self.reward_data[_reward_token].distributor = _distributor
     self.reward_tokens[reward_count] = _reward_token
@@ -589,31 +577,10 @@ def set_reward_distributor(_reward_token: address, _distributor: address):
     current_distributor: address = self.reward_data[_reward_token].distributor
 
     assert msg.sender == current_distributor or msg.sender == self.manager or msg.sender == Factory(FACTORY).owner()
-    assert current_distributor != empty(address)
-    assert _distributor != empty(address)
+    assert current_distributor != ZERO_ADDRESS
+    assert _distributor != ZERO_ADDRESS
 
     self.reward_data[_reward_token].distributor = _distributor
-
-
-@external
-def kick(addr: address):
-    """
-    @notice Kick `addr` for abusing their boost
-    @dev Only if either they had another voting event, or their voting escrow lock expired
-    @param addr Address to kick
-    """
-    voting_escrow: address = Factory(FACTORY).voting_escrow()
-    t_last: uint256 = self.integrate_checkpoint_of[addr]
-    t_ve: uint256 = VotingEscrow(voting_escrow).user_point_history__ts(
-        addr, VotingEscrow(voting_escrow).user_point_epoch(addr)
-    )
-    _balance: uint256 = self.balanceOf[addr]
-
-    assert ERC20(voting_escrow).balanceOf(addr) == 0 or t_ve > t_last # dev: kick not allowed
-    assert self.working_balances[addr] > _balance * convert(self.tokenless_production, uint256) / 100  # dev: kick not needed
-
-    self._checkpoint(addr)
-    self._update_liquidity_limit(addr, self.balanceOf[addr], self.totalSupply)
 
 
 @external
@@ -621,7 +588,7 @@ def kick(addr: address):
 def deposit_reward_token(_reward_token: address, _amount: uint256):
     assert msg.sender == self.reward_data[_reward_token].distributor
 
-    self._checkpoint_rewards(empty(address), self.totalSupply, False, empty(address))
+    self._checkpoint_rewards(ZERO_ADDRESS, self.totalSupply, False, ZERO_ADDRESS)
 
     response: Bytes[32] = raw_call(
         _reward_token,
@@ -656,49 +623,22 @@ def set_manager(_manager: address):
 
 
 @external
-def makeGaugePermissionless():
+def update_voting_escrow():
     """
-    @notice Uses the Uniswap Poor oracle to decide whether a gauge is alive
+    @notice Update the voting escrow contract in storage
     """
-    assert msg.sender == Factory(FACTORY).owner() # dev: only owner
-
-    self.gauge_state = 0 # PERMISSIONLESS
+    self.voting_escrow = Factory(FACTORY).voting_escrow()
 
 
 @external
-def killGauge():
+def set_killed(_is_killed: bool):
     """
-    @notice Kills the gauge so it always yields a rate of 0 and so cannot mint rewards
+    @notice Set the kill status of the gauge
+    @param _is_killed Kill status to put the gauge into
     """
-    assert msg.sender == Factory(FACTORY).owner() # dev: only owner
+    assert msg.sender == Factory(FACTORY).owner()
 
-    self.gauge_state = 1 # DEAD
-
-
-@external
-def unkillGauge():
-    """
-    @notice Unkills the gauge so it can mint rewards again
-    """
-    assert msg.sender == Factory(FACTORY).owner() # dev: only owner
-
-    self.gauge_state = 2 # ALIVE
-
-
-@external
-def set_tokenless_production(new_tokenless_production: uint8):
-    """
-    @notice Updates the tokenless production weight, which affects how
-    much staking weight is given to liquidity and how much is given to
-    vote locked tokens.
-    @param new_tokenless_production The new tokenless_production value
-    """
-    assert msg.sender == Factory(FACTORY).owner() # dev: only owner
-    assert new_tokenless_production <= 100 # dev: has to be between 0 and 100
-
-    self.tokenless_production = new_tokenless_production
-
-    log NewTokenlessProduction(new_tokenless_production)
+    self.is_killed = _is_killed
 
 
 @view
@@ -729,34 +669,16 @@ def factory() -> address:
 
 
 @external
-@view
-def is_killed() -> bool:
-    return self._is_killed()
-
-
-@internal
-@view
-def _is_killed() -> bool:
-    _gauge_state: uint8 = self.gauge_state
-
-    if _gauge_state == 0:
-        # PERMISSIONLESS
-        return UNISWAP_POOR_ORACLE.getPositionStateFromKey(self.position_key) == 2 # PositionState.OUT_OF_RANGE
-    else:
-        # DEAD or ALIVE
-        return _gauge_state == 1 # DEAD
-
-
-@external
-def initialize(_lp_token: address, _manager: address, _position_key: bytes32):
-    assert self.lp_token == empty(address)  # dev: already initialzed
+def initialize(_lp_token: address, _manager: address):
+    assert self.lp_token == ZERO_ADDRESS  # dev: already initialzed
 
     self.lp_token = _lp_token
     self.manager = _manager
-    self.position_key = _position_key
+
+    self.voting_escrow = Factory(msg.sender).voting_escrow()
 
     symbol: String[26] = ERC20Extended(_lp_token).symbol()
-    name: String[64] = concat("Timeless ", symbol, " Gauge Deposit")
+    name: String[64] = concat("Curve.fi ", symbol, " Gauge Deposit")
 
     self.name = name
     self.symbol = concat(symbol, "-gauge")

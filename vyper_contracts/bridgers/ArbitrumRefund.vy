@@ -1,7 +1,6 @@
-# @version 0.3.7
+# @version 0.3.1
 """
 @notice Curve Arbitrum Bridge Wrapper Refunder
-@dev Should be deployed to the same address as ArbitrumBridger on Arbitrum
 """
 
 
@@ -18,7 +17,7 @@ future_owner: public(address)
 def __init__():
     self.owner = msg.sender
 
-    log TransferOwnership(empty(address), msg.sender)
+    log TransferOwnership(ZERO_ADDRESS, msg.sender)
 
 
 @payable

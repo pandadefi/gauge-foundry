@@ -1,4 +1,4 @@
-# @version 0.3.7
+# @version 0.3.1
 """
 @title Root Liquidity Gauge Implementation
 @license MIT
@@ -10,10 +10,9 @@ interface Bridger:
     def cost() -> uint256: view
     def bridge(_token: address, _destination: address, _amount: uint256): payable
 
-interface TokenAdmin:
-    def start_epoch_time_write() -> uint256: nonpayable
-    def future_epoch_time_write() -> uint256: nonpayable
+interface CRV20:
     def rate() -> uint256: view
+    def future_epoch_time_write() -> uint256: nonpayable
 
 interface ERC20:
     def balanceOf(_account: address) -> uint256: view
@@ -30,13 +29,6 @@ interface Factory:
 
 interface Minter:
     def mint(_gauge: address): nonpayable
-    def getToken() -> address: view
-    def getTokenAdmin() -> address: view
-    def getGaugeController() -> address: view
-
-
-event RelativeWeightCapChanged:
-    new_relative_weight_cap: uint256
 
 
 struct InflationParams:
@@ -44,21 +36,18 @@ struct InflationParams:
     finish_time: uint256
 
 
-MAX_RELATIVE_WEIGHT_CAP: constant(uint256) = 10 ** 18
 WEEK: constant(uint256) = 604800
 YEAR: constant(uint256) = 86400 * 365
 RATE_DENOMINATOR: constant(uint256) = 10 ** 18
 RATE_REDUCTION_COEFFICIENT: constant(uint256) = 1189207115002721024  # 2 ** (1/4) * 1e18
 RATE_REDUCTION_TIME: constant(uint256) = YEAR
 
-TOKEN: immutable(address)
+CRV: immutable(address)
 GAUGE_CONTROLLER: immutable(address)
 MINTER: immutable(address)
-TOKEN_ADMIN: immutable(address)
 
 
 chain_id: public(uint256)
-is_killed: public(bool)
 bridger: public(address)
 factory: public(address)
 inflation_params: public(InflationParams)
@@ -66,16 +55,16 @@ inflation_params: public(InflationParams)
 last_period: public(uint256)
 total_emissions: public(uint256)
 
-_relative_weight_cap: uint256
+is_killed: public(bool)
+
 
 @external
-def __init__(_minter: address):
+def __init__(_crv_token: address, _gauge_controller: address, _minter: address):
     self.factory = 0x000000000000000000000000000000000000dEaD
 
     # assign immutable variables
-    TOKEN = Minter(_minter).getToken()
-    TOKEN_ADMIN = Minter(_minter).getTokenAdmin()
-    GAUGE_CONTROLLER = Minter(_minter).getGaugeController()
+    CRV = _crv_token
+    GAUGE_CONTROLLER = _gauge_controller
     MINTER = _minter
 
 
@@ -93,11 +82,12 @@ def transmit_emissions():
     assert msg.sender == self.factory  # dev: call via factory
 
     Minter(MINTER).mint(self)
-    minted: uint256 = ERC20(TOKEN).balanceOf(self)
+    minted: uint256 = ERC20(CRV).balanceOf(self)
 
-    if minted != 0:
-        bridger: address = self.bridger
-        Bridger(bridger).bridge(TOKEN, self, minted, value=Bridger(bridger).cost())
+    assert minted != 0  # dev: nothing minted
+    bridger: address = self.bridger
+
+    Bridger(bridger).bridge(CRV, self, minted, value=Bridger(bridger).cost())
 
 
 @view
@@ -139,7 +129,7 @@ def user_checkpoint(_user: address) -> bool:
                 # don't calculate emissions for the current period
                 break
             period_time: uint256 = i * WEEK
-            weight: uint256 = self._getCappedRelativeWeight(period_time)
+            weight: uint256 = GaugeController(GAUGE_CONTROLLER).gauge_relative_weight(self, period_time)
 
             if period_time <= params.finish_time and params.finish_time < period_time + WEEK:
                 # calculate with old rate
@@ -173,8 +163,8 @@ def set_killed(_is_killed: bool):
         self.inflation_params.rate = 0
     else:
         self.inflation_params = InflationParams({
-            rate: TokenAdmin(TOKEN_ADMIN).rate(),
-            finish_time: TokenAdmin(TOKEN_ADMIN).future_epoch_time_write()
+            rate: CRV20(CRV).rate(),
+            finish_time: CRV20(CRV).future_epoch_time_write()
         })
         self.last_period = block.timestamp / WEEK
     self.is_killed = _is_killed
@@ -188,88 +178,29 @@ def update_bridger():
     """
     # reset approval
     bridger: address = Factory(self.factory).get_bridger(self.chain_id)
-    ERC20(TOKEN).approve(self.bridger, 0)
-    ERC20(TOKEN).approve(bridger, max_value(uint256))
+    ERC20(CRV).approve(self.bridger, 0)
+    ERC20(CRV).approve(bridger, MAX_UINT256)
     self.bridger = bridger
 
 
 @external
-def setRelativeWeightCap(relative_weight_cap: uint256):
-    """
-    @notice Sets a new relative weight cap for the gauge.
-            The value shall be normalized to 1e18, and not greater than MAX_RELATIVE_WEIGHT_CAP.
-    @param relative_weight_cap New relative weight cap.
-    """
-    assert msg.sender == Factory(self.factory).owner()  # dev: only owner
-    self._setRelativeWeightCap(relative_weight_cap)
-
-
-@external
-@view
-def getRelativeWeightCap() -> uint256:
-    """
-    @notice Returns relative weight cap for the gauge.
-    """
-    return self._relative_weight_cap
-
-
-@external
-@view
-def getCappedRelativeWeight(time: uint256) -> uint256:
-    """
-    @notice Returns the gauge's relative weight for a given time, capped to its _relative_weight_cap attribute.
-    @param time Timestamp in the past or present.
-    """
-    return self._getCappedRelativeWeight(time)
-
-
-@external
-@pure
-def getMaxRelativeWeightCap() -> uint256:
-    """
-    @notice Returns the maximum value that can be set to _relative_weight_cap attribute.
-    """
-    return MAX_RELATIVE_WEIGHT_CAP
-
-
-@internal
-@view
-def _getCappedRelativeWeight(period: uint256) -> uint256:
-    """
-    @dev Returns the gauge's relative weight, capped to its _relative_weight_cap attribute.
-    """
-    return min(GaugeController(GAUGE_CONTROLLER).gauge_relative_weight(self, period), self._relative_weight_cap)
-
-
-@internal
-def _setRelativeWeightCap(relative_weight_cap: uint256):
-    assert relative_weight_cap <= MAX_RELATIVE_WEIGHT_CAP, "Relative weight cap exceeds allowed absolute maximum"
-    self._relative_weight_cap = relative_weight_cap
-    log RelativeWeightCapChanged(relative_weight_cap)
-
-
-@external
-def initialize(_bridger: address, _chain_id: uint256, _relative_weight_cap: uint256):
+def initialize(_bridger: address, _chain_id: uint256):
     """
     @notice Proxy initialization method
-    @param _bridger The initial bridger address
-    @param _chain_id The chainId of the corresponding ChildGauge
-    @param _relative_weight_cap The initial relative weight cap
     """
-    assert self.factory == empty(address)  # dev: already initialized
+    assert self.factory == ZERO_ADDRESS  # dev: already initialized
 
     self.chain_id = _chain_id
     self.bridger = _bridger
     self.factory = msg.sender
 
     inflation_params: InflationParams = InflationParams({
-        rate: TokenAdmin(TOKEN_ADMIN).rate(),
-        finish_time: TokenAdmin(TOKEN_ADMIN).future_epoch_time_write()
+        rate: CRV20(CRV).rate(),
+        finish_time: CRV20(CRV).future_epoch_time_write()
     })
     assert inflation_params.rate != 0
 
     self.inflation_params = inflation_params
     self.last_period = block.timestamp / WEEK
-    self._setRelativeWeightCap(_relative_weight_cap)
 
-    ERC20(TOKEN).approve(_bridger, max_value(uint256))
+    ERC20(CRV).approve(_bridger, MAX_UINT256)
