@@ -1,4 +1,4 @@
-# @version 0.3.1
+# @version 0.3.7
 """
 @title Voting Escrow Delegation
 @author Curve Finance
@@ -66,6 +66,12 @@ event GreyListUpdated:
     _delegator: indexed(address)
     _status: bool
 
+event NewPendingAdmin:
+    new_pending_admin: address
+
+event NewAdmin:
+    new_admin: address
+
 
 struct Boost:
     # [bias uint128][slope int128]
@@ -87,13 +93,26 @@ struct Point:
     bias: int256
     slope: int256
 
+struct CreateBoostCall:
+    delegator: address
+    receiver: address
+    percentage: int256
+    cancel_time: uint256
+    expire_time: uint256
+    id: uint256
+
+struct SetApprovalForAllCall:
+    operator: address
+    delegator: address # In the actual function call, this is msg.sender
 
 IDENTITY_PRECOMPILE: constant(address) = 0x0000000000000000000000000000000000000004
-MAX_PCT: constant(uint256) = 10_000
+MAX_PCT: constant(int256) = 10_000
 WEEK: constant(uint256) = 86400 * 7
 
-VOTING_ESCROW: immutable(address)
+VOTING_ESCROW: immutable(address)  # Voting escrow
 
+pending_admin: public(address)
+admin: public(address)
 
 balanceOf: public(HashMap[address, uint256])
 getApproved: public(HashMap[uint256, address])
@@ -108,39 +127,34 @@ totalSupply: public(uint256)
 # use totalSupply to determine the length
 tokenByIndex: public(HashMap[uint256, uint256])
 # use balanceOf to determine the length
-tokenOfOwnerByIndex: public(HashMap[address, uint256[MAX_UINT256]])
+tokenOfOwnerByIndex: public(HashMap[address, uint256[max_value(uint256)]])
 
 boost: HashMap[address, Boost]
 boost_tokens: HashMap[uint256, Token]
 
-token_of_delegator_by_index: public(HashMap[address, uint256[MAX_UINT256]])
+token_of_delegator_by_index: public(HashMap[address, uint256[max_value(uint256)]])
 total_minted: public(HashMap[address, uint256])
 # address => timestamp => # of delegations expiring
 account_expiries: public(HashMap[address, HashMap[uint256, uint256]])
-
-admin: public(address)  # Can and will be a smart contract
-future_admin: public(address)
 
 # The grey list - per-user black and white lists
 # users can make this a blacklist or a whitelist - defaults to blacklist
 # gray_list[_receiver][_delegator]
 # by default is blacklist, with no delegators blacklisted
-# if [_receiver][ZERO_ADDRESS] is False = Blacklist, True = Whitelist
+# if [_receiver][empty(address)] is False = Blacklist, True = Whitelist
 # if this is a blacklist, receivers disallow any delegations from _delegator if it is True
 # if this is a whitelist, receivers only allow delegations from _delegator if it is True
-# Delegation will go through if: not (grey_list[_receiver][ZERO_ADDRESS] ^ grey_list[_receiver][_delegator])
+# Delegation will go through if: not (grey_list[_receiver][empty(address)] ^ grey_list[_receiver][_delegator])
 grey_list: public(HashMap[address, HashMap[address, bool]])
 
-
 @external
-def __init__(_name: String[32], _symbol: String[32], _base_uri: String[128], _ve: address):
+def __init__(_voting_escrow: address, _name: String[32], _symbol: String[32], _base_uri: String[128], _admin: address):
+    VOTING_ESCROW = _voting_escrow
+    self.admin = _admin
+
     self.name = _name
     self.symbol = _symbol
     self.base_uri = _base_uri
-
-    self.admin = msg.sender
-
-    VOTING_ESCROW = _ve
 
 
 @internal
@@ -159,7 +173,6 @@ def _is_approved_or_owner(_spender: address, _token_id: uint256) -> bool:
         or self.isApprovedForAll[owner][_spender]
     )
 
-
 @internal
 def _update_enumeration_data(_from: address, _to: address, _token_id: uint256):
     delegator: address = convert(shift(_token_id, -96), address)
@@ -169,7 +182,7 @@ def _update_enumeration_data(_from: address, _to: address, _token_id: uint256):
     # position in the delegator array of minted tokens
     delegator_pos: uint256 = shift(self.boost_tokens[_token_id].dinfo, -128)
 
-    if _from == ZERO_ADDRESS:
+    if _from == empty(address):
         # minting - This is called before updates to balance and totalSupply
         local_pos = self.balanceOf[_to]
         global_pos = self.totalSupply
@@ -188,7 +201,7 @@ def _update_enumeration_data(_from: address, _to: address, _token_id: uint256):
         self.token_of_delegator_by_index[delegator][delegator_pos] = _token_id
         self.total_minted[delegator] = delegator_pos + 1
 
-    elif _to == ZERO_ADDRESS:
+    elif _to == empty(address):
         # burning - This is called after updates to balance and totalSupply
         # we operate on both the global array and local array
         last_global_index: uint256 = self.totalSupply
@@ -247,36 +260,36 @@ def _update_enumeration_data(_from: address, _to: address, _token_id: uint256):
 def _burn(_token_id: uint256):
     owner: address = self.ownerOf[_token_id]
 
-    self._approve(owner, ZERO_ADDRESS, _token_id)
+    self._approve(owner, empty(address), _token_id)
 
     self.balanceOf[owner] -= 1
-    self.ownerOf[_token_id] = ZERO_ADDRESS
+    self.ownerOf[_token_id] = empty(address)
     self.totalSupply -= 1
 
-    self._update_enumeration_data(owner, ZERO_ADDRESS, _token_id)
+    self._update_enumeration_data(owner, empty(address), _token_id)
 
-    log Transfer(owner, ZERO_ADDRESS, _token_id)
+    log Transfer(owner, empty(address), _token_id)
 
 
 @internal
 def _mint(_to: address, _token_id: uint256):
-    assert _to != ZERO_ADDRESS  # dev: minting to ZERO_ADDRESS disallowed
-    assert self.ownerOf[_token_id] == ZERO_ADDRESS  # dev: token exists
+    assert _to != empty(address)  # dev: minting to empty(address) disallowed
+    assert self.ownerOf[_token_id] == empty(address)  # dev: token exists
 
-    self._update_enumeration_data(ZERO_ADDRESS, _to, _token_id)
+    self._update_enumeration_data(empty(address), _to, _token_id)
 
     self.balanceOf[_to] += 1
     self.ownerOf[_token_id] = _to
     self.totalSupply += 1
 
-    log Transfer(ZERO_ADDRESS, _to, _token_id)
+    log Transfer(empty(address), _to, _token_id)
 
 
 @internal
 def _mint_boost(_token_id: uint256, _delegator: address, _receiver: address, _bias: int256, _slope: int256, _cancel_time: uint256, _expire_time: uint256):
-    is_whitelist: uint256 = convert(self.grey_list[_receiver][ZERO_ADDRESS], uint256)
+    is_whitelist: uint256 = convert(self.grey_list[_receiver][empty(address)], uint256)
     delegator_status: uint256 = convert(self.grey_list[_receiver][_delegator], uint256)
-    assert not convert(bitwise_xor(is_whitelist, delegator_status), bool)  # dev: mint boost not allowed
+    assert not convert((is_whitelist ^ delegator_status), bool)  # dev: mint boost not allowed
 
     data: uint256 = shift(convert(_bias, uint256), 128) + convert(abs(_slope), uint256)
     self.boost[_delegator].delegated += data
@@ -311,7 +324,7 @@ def _burn_boost(_token_id: uint256, _delegator: address, _receiver: address, _bi
     next_expiry: uint256 = expiry_data % 2 ** 128
     active_delegations: uint256 = shift(expiry_data, -128) - 1
 
-    expiries: uint256 = self.account_expiries[_delegator][expire_time]
+    expiries: uint256 = self.account_expiries[_delegator][expire_time] - 1
 
     if active_delegations != 0 and expire_time == next_expiry and expiries == 0:
         # Will be passed if
@@ -333,7 +346,7 @@ def _burn_boost(_token_id: uint256, _delegator: address, _receiver: address, _bi
         next_expiry = 0
 
     self.boost[_delegator].expiry_data = shift(active_delegations, 128) + next_expiry
-    self.account_expiries[_delegator][expire_time] = expiries - 1
+    self.account_expiries[_delegator][expire_time] = expiries
 
 
 @internal
@@ -361,15 +374,15 @@ def _calc_bias_slope(_x: int256, _y: int256, _expire_time: int256) -> Point:
 @internal
 def _transfer(_from: address, _to: address, _token_id: uint256):
     assert self.ownerOf[_token_id] == _from  # dev: _from is not owner
-    assert _to != ZERO_ADDRESS  # dev: transfers to ZERO_ADDRESS are disallowed
+    assert _to != empty(address)  # dev: transfers to empty(address) are disallowed
 
     delegator: address = convert(shift(_token_id, -96), address)
-    is_whitelist: uint256 = convert(self.grey_list[_to][ZERO_ADDRESS], uint256)
+    is_whitelist: uint256 = convert(self.grey_list[_to][empty(address)], uint256)
     delegator_status: uint256 = convert(self.grey_list[_to][delegator], uint256)
-    assert not convert(bitwise_xor(is_whitelist, delegator_status), bool)  # dev: transfer boost not allowed
+    assert not convert((is_whitelist ^ delegator_status), bool)  # dev: transfer boost not allowed
 
     # clear previous token approval
-    self._approve(_from, ZERO_ADDRESS, _token_id)
+    self._approve(_from, empty(address), _token_id)
 
     self.balanceOf[_from] -= 1
     self._update_enumeration_data(_from, _to, _token_id)
@@ -395,7 +408,7 @@ def _transfer(_from: address, _to: address, _token_id: uint256):
 @internal
 def _cancel_boost(_token_id: uint256, _caller: address):
     receiver: address = self.ownerOf[_token_id]
-    assert receiver != ZERO_ADDRESS  # dev: token does not exist
+    assert receiver != empty(address)  # dev: token does not exist
     delegator: address = convert(shift(_token_id, -96), address)
 
     token: Token = self.boost_tokens[_token_id]
@@ -495,6 +508,12 @@ def safeTransferFrom(_from: address, _to: address, _token_id: uint256, _data: By
         )  # dev: invalid response
 
 
+@internal
+def _setApprovalForAll(_delegator: address, _operator: address, _approved: bool):
+    self.isApprovedForAll[_delegator][_operator] = _approved
+    log ApprovalForAll(_delegator, _operator, _approved)
+
+
 @external
 def setApprovalForAll(_operator: address, _approved: bool):
     """
@@ -504,8 +523,7 @@ def setApprovalForAll(_operator: address, _approved: bool):
     @param _operator Address to add to the set of authorized operators.
     @param _approved True if the operator is approved, false to revoke approval.
     """
-    self.isApprovedForAll[msg.sender][_operator] = _approved
-    log ApprovalForAll(msg.sender, _operator, _approved)
+    self._setApprovalForAll(msg.sender, _operator, _approved)
 
 
 @external
@@ -516,7 +534,7 @@ def transferFrom(_from: address, _to: address, _token_id: uint256):
         THEY MAY BE PERMANENTLY LOST
     @dev Throws unless `msg.sender` is the current owner, an authorized
         operator, or the approved address for this NFT. Throws if `_from` is
-        not the current owner. Throws if `_to` is the ZERO_ADDRESS.
+        not the current owner. Throws if `_to` is the empty(address).
     @param _from The current owner of the NFT
     @param _to The new owner
     @param _token_id The NFT to transfer
@@ -555,8 +573,8 @@ def burn(_token_id: uint256):
     self._burn(_token_id)
 
 
-@external
-def create_boost(
+@internal
+def _create_boost(
     _delegator: address,
     _receiver: address,
     _percentage: int256,
@@ -564,32 +582,13 @@ def create_boost(
     _expire_time: uint256,
     _id: uint256,
 ):
-    """
-    @notice Create a boost and delegate it to another account.
-    @dev Delegated boost can become negative, and requires active management, else
-        the adjusted veCRV balance of the delegator's account will decrease until reaching 0
-    @param _delegator The account to delegate boost from
-    @param _receiver The account to receive the delegated boost
-    @param _percentage Since veCRV is a constantly decreasing asset, we use percentage to determine
-        the amount of delegator's boost to delegate
-    @param _cancel_time A point in time before _expire_time in which the delegator or their operator
-        can cancel the delegated boost
-    @param _expire_time The point in time, atleast a day in the future, at which the value of the boost
-        will reach 0. After which the negative value is deducted from the delegator's account (and the
-        receiver's received boost only) until it is cancelled. This value is rounded down to the nearest
-        WEEK.
-    @param _id The token id, within the range of [0, 2 ** 96). Useful for contracts given operator status
-        to have specific ranges.
-    """
-    assert msg.sender == _delegator or self.isApprovedForAll[_delegator][msg.sender]  # dev: only delegator or operator
-
     expire_time: uint256 = (_expire_time / WEEK) * WEEK
 
     expiry_data: uint256 = self.boost[_delegator].expiry_data
     next_expiry: uint256 = expiry_data % 2 ** 128
 
     if next_expiry == 0:
-        next_expiry = MAX_UINT256
+        next_expiry = max_value(uint256)
 
     assert block.timestamp < next_expiry  # dev: negative boost token is in circulation
     assert _percentage > 0  # dev: percentage must be greater than 0 bps
@@ -633,6 +632,36 @@ def create_boost(
 
 
 @external
+def create_boost(
+    _delegator: address,
+    _receiver: address,
+    _percentage: int256,
+    _cancel_time: uint256,
+    _expire_time: uint256,
+    _id: uint256,
+):
+    """
+    @notice Create a boost and delegate it to another account.
+    @dev Delegated boost can become negative, and requires active management, else
+        the adjusted veCRV balance of the delegator's account will decrease until reaching 0
+    @param _delegator The account to delegate boost from
+    @param _receiver The account to receive the delegated boost
+    @param _percentage Since veCRV is a constantly decreasing asset, we use percentage to determine
+        the amount of delegator's boost to delegate
+    @param _cancel_time A point in time before _expire_time in which the delegator or their operator
+        can cancel the delegated boost
+    @param _expire_time The point in time, atleast a day in the future, at which the value of the boost
+        will reach 0. After which the negative value is deducted from the delegator's account (and the
+        receiver's received boost only) until it is cancelled. This value is rounded down to the nearest
+        WEEK.
+    @param _id The token id, within the range of [0, 2 ** 96). Useful for contracts given operator status
+        to have specific ranges.
+    """
+    assert msg.sender == _delegator or self.isApprovedForAll[_delegator][msg.sender]  # dev: only delegator or operator
+    self._create_boost(_delegator, _receiver, _percentage, _cancel_time, _expire_time, _id)
+
+
+@external
 def extend_boost(_token_id: uint256, _percentage: int256, _expire_time: uint256, _cancel_time: uint256):
     """
     @notice Extend the boost of an existing boost or expired boost
@@ -651,7 +680,7 @@ def extend_boost(_token_id: uint256, _percentage: int256, _expire_time: uint256,
     receiver: address = self.ownerOf[_token_id]
 
     assert msg.sender == delegator or self.isApprovedForAll[delegator][msg.sender]  # dev: only delegator or operator
-    assert receiver != ZERO_ADDRESS  # dev: boost token does not exist
+    assert receiver != empty(address)  # dev: boost token does not exist
     assert _percentage > 0  # dev: percentage must be greater than 0 bps
     assert _percentage <= MAX_PCT  # dev: percentage must be less than 10_000 bps
 
@@ -684,7 +713,7 @@ def extend_boost(_token_id: uint256, _percentage: int256, _expire_time: uint256,
     next_expiry: uint256 = expiry_data % 2 ** 128
 
     if next_expiry == 0:
-        next_expiry = MAX_UINT256
+        next_expiry = max_value(uint256)
 
     assert block.timestamp < next_expiry  # dev: negative outstanding boosts
 
@@ -752,9 +781,9 @@ def batch_cancel_boosts(_token_ids: uint256[256]):
 def set_delegation_status(_receiver: address, _delegator: address, _status: bool):
     """
     @notice Set or reaffirm the blacklist/whitelist status of a delegator for a receiver.
-    @dev Setting delegator as the ZERO_ADDRESS enables users to deactive delegations globally
+    @dev Setting delegator as the empty(address) enables users to deactive delegations globally
         and enable the white list. The ability of a delegator to delegate to a receiver
-        is determined by ~(grey_list[_receiver][ZERO_ADDRESS] ^ grey_list[_receiver][_delegator]).
+        is determined by ~(grey_list[_receiver][empty(address)] ^ grey_list[_receiver][_delegator]).
     @param _receiver The account which we will be updating it's list
     @param _delegator The account to disallow/allow delegations from
     @param _status Boolean of the status to set the _delegator account to
@@ -767,14 +796,13 @@ def set_delegation_status(_receiver: address, _delegator: address, _status: bool
 def batch_set_delegation_status(_receiver: address, _delegators: address[256], _status: uint256[256]):
     """
     @notice Set or reaffirm the blacklist/whitelist status of multiple delegators for a receiver.
-    @dev Setting delegator as the ZERO_ADDRESS enables users to deactive delegations globally
+    @dev Setting delegator as the empty(address) enables users to deactive delegations globally
         and enable the white list. The ability of a delegator to delegate to a receiver
-        is determined by ~(grey_list[_receiver][ZERO_ADDRESS] ^ grey_list[_receiver][_delegator]).
+        is determined by ~(grey_list[_receiver][empty(address)] ^ grey_list[_receiver][_delegator]).
     @param _receiver The account which we will be updating it's list
     @param _delegators List of 256 accounts to disallow/allow delegations from
     @param _status List of 256 0s and 1s (booleans) of the status to set the _delegator_i account to.
         if the value is not 0 or 1, execution will break, effectively stopping at the index.
-
     """
     assert msg.sender == _receiver or self.isApprovedForAll[_receiver][msg.sender]  # dev: only receiver or operator
 
@@ -929,7 +957,7 @@ def calc_boost_bias_slope(
     time: int256 = convert(block.timestamp, int256)
     assert _percentage > 0  # dev: percentage must be greater than 0
     assert _percentage <= MAX_PCT  # dev: percentage must be less than or equal to 100%
-    assert _expire_time > time + WEEK  # dev: Invalid min expiry time
+    assert _expire_time > time + convert(WEEK, int256)  # dev: Invalid min expiry time
 
     lock_expiry: int256 = convert(VotingEscrow(VOTING_ESCROW).locked__end(_delegator), int256)
     assert _expire_time <= lock_expiry
@@ -970,26 +998,32 @@ def get_token_id(_delegator: address, _id: uint256) -> uint256:
 
 
 @external
-def commit_transfer_ownership(_addr: address):
-    """
-    @notice Transfer ownership of contract to `addr`
-    @param _addr Address to have ownership transferred to
-    """
-    assert msg.sender == self.admin  # dev: admin only
-    self.future_admin = _addr
-
-
-@external
-def accept_transfer_ownership():
-    """
-    @notice Accept admin role, only callable by future admin
-    """
-    future_admin: address = self.future_admin
-    assert msg.sender == future_admin
-    self.admin = future_admin
-
-
-@external
 def set_base_uri(_base_uri: String[128]):
     assert msg.sender == self.admin
     self.base_uri = _base_uri
+
+
+@external
+def change_pending_admin(new_pending_admin: address):
+    """
+    @notice Change pending_admin to `new_pending_admin`
+    @param new_pending_admin The new pending_admin address
+    """
+    assert msg.sender == self.admin
+
+    self.pending_admin = new_pending_admin
+
+    log NewPendingAdmin(new_pending_admin)
+
+
+@external
+def claim_admin():
+    """
+    @notice Called by pending_admin to set admin to pending_admin
+    """
+    assert msg.sender == self.pending_admin
+
+    self.admin = msg.sender
+    self.pending_admin = empty(address)
+
+    log NewAdmin(msg.sender)

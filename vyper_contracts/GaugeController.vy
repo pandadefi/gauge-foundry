@@ -1,5 +1,4 @@
-# @version 0.2.4
-
+# @version 0.3.7
 """
 @title Gauge Controller
 @author Curve Finance
@@ -25,15 +24,9 @@ struct VotedSlope:
 
 
 interface VotingEscrow:
+    def token() -> address: view
     def get_last_user_slope(addr: address) -> int128: view
     def locked__end(addr: address) -> uint256: view
-
-
-event CommitOwnership:
-    admin: address
-
-event ApplyOwnership:
-    admin: address
 
 event AddType:
     name: String[64]
@@ -62,14 +55,20 @@ event NewGauge:
     gauge_type: int128
     weight: uint256
 
+event NewPendingAdmin:
+    new_pending_admin: address
+
+event NewAdmin:
+    new_admin: address
+
 
 MULTIPLIER: constant(uint256) = 10 ** 18
 
-admin: public(address)  # Can and will be a smart contract
-future_admin: public(address)  # Can and will be a smart contract
+TOKEN: immutable(address) # The token to escrow
+VOTING_ESCROW: immutable(address) # Voting escrow
 
-token: public(address)  # CRV token
-voting_escrow: public(address)  # Voting escrow
+pending_admin: public(address)
+admin: public(address)
 
 # Gauge parameters
 # All numbers are "fixed point" on the basis of 1e18
@@ -110,42 +109,43 @@ time_type_weight: public(uint256[1000000000])  # type_id -> last scheduled time 
 
 
 @external
-def __init__(_token: address, _voting_escrow: address):
+def __init__(_voting_escrow: address, _admin: address):
     """
     @notice Contract constructor
-    @param _token `ERC20CRV` contract address
     @param _voting_escrow `VotingEscrow` contract address
+    @param _admin The admin address
     """
-    assert _token != ZERO_ADDRESS
-    assert _voting_escrow != ZERO_ADDRESS
+    assert _voting_escrow != empty(address)
+    assert _admin != empty(address)
 
-    self.admin = msg.sender
-    self.token = _token
-    self.voting_escrow = _voting_escrow
+    TOKEN = VotingEscrow(_voting_escrow).token()
+    VOTING_ESCROW = _voting_escrow
+    self.admin = _admin
     self.time_total = block.timestamp / WEEK * WEEK
 
 
 @external
-def commit_transfer_ownership(addr: address):
-    """
-    @notice Transfer ownership of GaugeController to `addr`
-    @param addr Address to have ownership transferred to
-    """
-    assert msg.sender == self.admin  # dev: admin only
-    self.future_admin = addr
-    log CommitOwnership(addr)
+@view
+def token() -> address:
+    return TOKEN
 
 
 @external
-def apply_transfer_ownership():
+@view
+def voting_escrow() -> address:
+    return VOTING_ESCROW
+
+
+@external
+@view
+def gauge_exists(_addr: address) -> bool:
     """
-    @notice Apply pending ownership transfer
+    @notice Get whether gauge already exists on GaugeController
+    @param _addr Gauge address
+    @return true if the gauge exists
     """
-    assert msg.sender == self.admin  # dev: admin only
-    _admin: address = self.future_admin
-    assert _admin != ZERO_ADDRESS  # dev: admin not set
-    self.admin = _admin
-    log ApplyOwnership(_admin)
+    gauge_type: int128 = self.gauge_types_[_addr]
+    return gauge_type > 0
 
 
 @external
@@ -481,42 +481,42 @@ def change_gauge_weight(addr: address, weight: uint256):
     self._change_gauge_weight(addr, weight)
 
 
-@external
-def vote_for_gauge_weights(_gauge_addr: address, _user_weight: uint256):
+@internal
+def _vote_for_gauge_weights(_user: address, _gauge_addr: address, _user_weight: uint256):
     """
     @notice Allocate voting power for changing pool weights
-    @param _gauge_addr Gauge which `msg.sender` votes for
+    @param _user User to allocate voting power for
+    @param _gauge_addr Gauge which _user votes for
     @param _user_weight Weight for a gauge in bps (units of 0.01%). Minimal is 0.01%. Ignored if 0
     """
-    escrow: address = self.voting_escrow
-    slope: uint256 = convert(VotingEscrow(escrow).get_last_user_slope(msg.sender), uint256)
-    lock_end: uint256 = VotingEscrow(escrow).locked__end(msg.sender)
+    slope: uint256 = convert(VotingEscrow(VOTING_ESCROW).get_last_user_slope(_user), uint256)
+    lock_end: uint256 = VotingEscrow(VOTING_ESCROW).locked__end(_user)
     _n_gauges: int128 = self.n_gauges
     next_time: uint256 = (block.timestamp + WEEK) / WEEK * WEEK
     assert lock_end > next_time, "Your token lock expires too soon"
     assert (_user_weight >= 0) and (_user_weight <= 10000), "You used all your voting power"
-    assert block.timestamp >= self.last_user_vote[msg.sender][_gauge_addr] + WEIGHT_VOTE_DELAY, "Cannot vote so often"
+    assert block.timestamp >= self.last_user_vote[_user][_gauge_addr] + WEIGHT_VOTE_DELAY, "Cannot vote so often"
 
     gauge_type: int128 = self.gauge_types_[_gauge_addr] - 1
     assert gauge_type >= 0, "Gauge not added"
     # Prepare slopes and biases in memory
-    old_slope: VotedSlope = self.vote_user_slopes[msg.sender][_gauge_addr]
+    old_slope: VotedSlope = self.vote_user_slopes[_user][_gauge_addr]
     old_dt: uint256 = 0
     if old_slope.end > next_time:
         old_dt = old_slope.end - next_time
     old_bias: uint256 = old_slope.slope * old_dt
     new_slope: VotedSlope = VotedSlope({
         slope: slope * _user_weight / 10000,
-        end: lock_end,
-        power: _user_weight
+        power: _user_weight,
+        end: lock_end
     })
     new_dt: uint256 = lock_end - next_time  # dev: raises when expired
     new_bias: uint256 = new_slope.slope * new_dt
 
     # Check and update powers (weights) used
-    power_used: uint256 = self.vote_user_power[msg.sender]
+    power_used: uint256 = self.vote_user_power[_user]
     power_used = power_used + new_slope.power - old_slope.power
-    self.vote_user_power[msg.sender] = power_used
+    self.vote_user_power[_user] = power_used
     assert (power_used >= 0) and (power_used <= 10000), 'Used too much power'
 
     ## Remove old and schedule new slope changes
@@ -545,13 +545,24 @@ def vote_for_gauge_weights(_gauge_addr: address, _user_weight: uint256):
 
     self._get_total()
 
-    self.vote_user_slopes[msg.sender][_gauge_addr] = new_slope
+    self.vote_user_slopes[_user][_gauge_addr] = new_slope
 
     # Record last action time
-    self.last_user_vote[msg.sender][_gauge_addr] = block.timestamp
+    self.last_user_vote[_user][_gauge_addr] = block.timestamp
 
-    log VoteForGauge(block.timestamp, msg.sender, _gauge_addr, _user_weight)
+    log VoteForGauge(block.timestamp, _user, _gauge_addr, _user_weight)
 
+@external
+@nonreentrant('lock')
+def vote_for_many_gauge_weights(_gauge_addrs: address[8], _user_weight: uint256[8]):
+    for i in range(8):
+        if _gauge_addrs[i] == empty(address):
+            break
+        self._vote_for_gauge_weights(msg.sender, _gauge_addrs[i], _user_weight[i])
+
+@external
+def vote_for_gauge_weights(_gauge_addr: address, _user_weight: uint256):
+    self._vote_for_gauge_weights(msg.sender, _gauge_addr, _user_weight)
 
 @external
 @view
@@ -594,3 +605,29 @@ def get_weights_sum_per_type(type_id: int128) -> uint256:
     @return Sum of gauge weights
     """
     return self.points_sum[type_id][self.time_sum[type_id]].bias
+
+
+@external
+def change_pending_admin(new_pending_admin: address):
+    """
+    @notice Change pending_admin to `new_pending_admin`
+    @param new_pending_admin The new pending_admin address
+    """
+    assert msg.sender == self.admin
+
+    self.pending_admin = new_pending_admin
+
+    log NewPendingAdmin(new_pending_admin)
+
+
+@external
+def claim_admin():
+    """
+    @notice Called by pending_admin to set admin to pending_admin
+    """
+    assert msg.sender == self.pending_admin
+
+    self.admin = msg.sender
+    self.pending_admin = empty(address)
+
+    log NewAdmin(msg.sender)

@@ -1,6 +1,8 @@
-# @version 0.3.1
+# @version 0.3.7
 """
 @notice Curve Gnosis (prev Xdai) Omni Bridge Wrapper
+@dev See https://docs.openzeppelin.com/contracts/4.x/api/crosschain#CrossChainEnabledAMB for the list
+of bridges supported by Omni
 """
 from vyper.interfaces import ERC20
 
@@ -9,17 +11,19 @@ interface OmniBridge:
     def relayTokens(_token: address, _receiver: address, _value: uint256): nonpayable
 
 
-CRV20: constant(address) = 0xD533a949740bb3306d119CC777fa900bA034cd52
-OMNI_BRIDGE: constant(address) = 0x88ad09518695c6c3712AC10a214bE5109a655671
-
+OMNI_BRIDGE: immutable(address)
+TOKEN: immutable(address)
 
 is_approved: public(HashMap[address, bool])
 
 
 @external
-def __init__():
-    assert ERC20(CRV20).approve(OMNI_BRIDGE, MAX_UINT256)
-    self.is_approved[CRV20] = True
+def __init__(_token: address, _omni_bridge: address):
+    TOKEN = _token
+    OMNI_BRIDGE = _omni_bridge
+
+    assert ERC20(_token).approve(_omni_bridge, max_value(uint256))
+    self.is_approved[_token] = True
 
 
 @external
@@ -32,8 +36,8 @@ def bridge(_token: address, _to: address, _amount: uint256):
     """
     assert ERC20(_token).transferFrom(msg.sender, self, _amount)
 
-    if _token != CRV20 and not self.is_approved[_token]:
-        assert ERC20(_token).approve(OMNI_BRIDGE, MAX_UINT256)
+    if _token != TOKEN and not self.is_approved[_token]:
+        assert ERC20(_token).approve(OMNI_BRIDGE, max_value(uint256))
         self.is_approved[_token] = True
 
     OmniBridge(OMNI_BRIDGE).relayTokens(_token, _to, _amount)

@@ -1,4 +1,4 @@
-# @version 0.3.1
+# @version 0.3.7
 """
 @notice Curve Arbitrum Bridge Wrapper
 """
@@ -26,10 +26,10 @@ event UpdateSubmissionData:
     _new_submission_data: uint256[3]
 
 
-CRV20: constant(address) = 0xD533a949740bb3306d119CC777fa900bA034cd52
 GATEWAY: constant(address) = 0xa3A7B6F88361F48403514059F1F16C8E78d60EeC
 GATEWAY_ROUTER: constant(address) = 0x72Ce9c846789fdB6fC1f34aC4AD25Dd9ef7031ef
 
+TOKEN: immutable(address)
 
 # [gas_limit uint64][gas_price uint64][max_submission_cost uint64]
 submission_data: uint256
@@ -40,18 +40,20 @@ future_owner: public(address)
 
 
 @external
-def __init__(_gas_limit: uint256, _gas_price: uint256, _max_submission_cost: uint256):
+def __init__(_token: address, _gas_limit: uint256, _gas_price: uint256, _max_submission_cost: uint256):
     for value in [_gas_limit, _gas_price, _max_submission_cost]:
         assert value < 2 ** 64
+
+    TOKEN = _token
 
     self.submission_data = shift(_gas_limit, 128) + shift(_gas_price, 64) + _max_submission_cost
     log UpdateSubmissionData([0, 0, 0], [_gas_limit, _gas_price, _max_submission_cost])
 
-    assert ERC20(CRV20).approve(GATEWAY, MAX_UINT256)
-    self.is_approved[CRV20] = True
+    assert ERC20(_token).approve(GATEWAY, max_value(uint256))
+    self.is_approved[_token] = True
 
     self.owner = msg.sender
-    log TransferOwnership(ZERO_ADDRESS, msg.sender)
+    log TransferOwnership(empty(address), msg.sender)
 
 
 @payable
@@ -65,8 +67,8 @@ def bridge(_token: address, _to: address, _amount: uint256):
     """
     assert ERC20(_token).transferFrom(msg.sender, self, _amount)
 
-    if _token != CRV20 and not self.is_approved[_token]:
-        assert ERC20(_token).approve(GatewayRouter(GATEWAY_ROUTER).getGateway(_token), MAX_UINT256)
+    if _token != TOKEN and not self.is_approved[_token]:
+        assert ERC20(_token).approve(GatewayRouter(GATEWAY_ROUTER).getGateway(_token), max_value(uint256))
         self.is_approved[_token] = True
 
     data: uint256 = self.submission_data
